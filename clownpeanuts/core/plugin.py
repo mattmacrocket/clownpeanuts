@@ -23,6 +23,9 @@ ALLOWED_EMULATOR_MODULES = frozenset(
         "clownpeanuts.services.database.mongo_emulator",
         "clownpeanuts.services.database.memcached_emulator",
         "clownpeanuts.services.dummy.emulator",
+        # HueyDeweyLouie persona engine — fake LLM endpoint deception service.
+        # Spec: hueydeweylouie/docs/HUEYDEWEYLOUIE-SPEC.md
+        "clownpeanuts.services.vuln_llm.emulator",
     }
 )
 
