@@ -15,13 +15,24 @@ Spec: docs/HUEYDEWEYLOUIE-SPEC.md §10.
 from __future__ import annotations
 
 import json
+import re
 import threading
 import time
-from collections import defaultdict
+from collections import OrderedDict
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any
 from uuid import uuid4
+
+# Bound the per-session turn counter dict so unique session_ids
+# (e.g., when no X-Session-Id header is sent) can't grow memory.
+_MAX_TURN_COUNTER_ENTRIES = 4096
+
+# X-Session-Id is echoed in the response and used as a cache key
+# everywhere downstream. Reject anything that could enable header
+# injection (CRLF), path-traversal-style cache poisoning, or just
+# unreasonable lengths. Everything else falls back to a fresh UUID.
+_SESSION_ID_RE = re.compile(r"^[A-Za-z0-9._:-]{1,128}$")
 
 from clownpeanuts.config.schema import ServiceConfig
 from clownpeanuts.core.logging import get_logger
@@ -102,7 +113,9 @@ class Emulator(ServiceEmulator):
         self._system_prompt: str = ""
         self._gen_defaults: GenerationParams = GenerationParams()
         # Per-session turn counter for canary template rotation.
-        self._turn_counter: dict[str, int] = defaultdict(int)
+        # Bounded LRU dict so attackers spamming requests with novel
+        # session_ids cannot exhaust memory.
+        self._turn_counter: OrderedDict[str, int] = OrderedDict()
         self._turn_counter_lock = threading.Lock()
 
     # ------- Required ServiceEmulator interface -------
@@ -413,6 +426,11 @@ class Emulator(ServiceEmulator):
         except (json.JSONDecodeError, UnicodeDecodeError, OSError):
             self._respond_error(handler, 400, "invalid JSON body")
             return
+        except RecursionError:
+            # Deeply nested JSON ([[[[...]]]] etc.) exceeds recursion
+            # limit. Reject cleanly instead of crashing the worker thread.
+            self._respond_error(handler, 400, "JSON body nesting too deep")
+            return
 
         messages = request.get("messages")
         if not isinstance(messages, list) or not messages:
@@ -432,16 +450,30 @@ class Emulator(ServiceEmulator):
         if not last_user_content:
             last_user_content = "(no user message)"
 
-        # Session correlation (header override for testing; otherwise new UUID).
-        session_id = handler.headers.get("X-Session-Id") or str(uuid4())
+        # Session correlation. The X-Session-Id header is attacker-controlled,
+        # so it's restricted to a safe alphabet to prevent CRLF injection
+        # in the response (Python <3.12 does not validate header values)
+        # and to prevent unbounded-length cache keys downstream. Anything
+        # else falls back to a fresh UUID.
+        raw_session = handler.headers.get("X-Session-Id", "")
+        if raw_session and _SESSION_ID_RE.match(raw_session):
+            session_id = raw_session
+        else:
+            session_id = str(uuid4())
         client_addr = getattr(handler, "client_address", None) or ("unknown", 0)
         source_ip, source_port = str(client_addr[0]), int(client_addr[1])
 
         # Per-session monotonically-increasing turn counter (for canary
         # template rotation). Reset is implicit on emulator restart.
+        # OrderedDict gives LRU eviction so distinct session_ids cannot
+        # exhaust memory.
         with self._turn_counter_lock:
-            self._turn_counter[session_id] += 1
-            turn_n = self._turn_counter[session_id]
+            current = self._turn_counter.get(session_id, 0) + 1
+            self._turn_counter[session_id] = current
+            self._turn_counter.move_to_end(session_id)
+            while len(self._turn_counter) > _MAX_TURN_COUNTER_ENTRIES:
+                self._turn_counter.popitem(last=False)
+            turn_n = current
 
         # Per-turn finding: turn_received
         self._emit_session_event(
@@ -678,7 +710,11 @@ class Emulator(ServiceEmulator):
         """Run the loaded inference backend. Returns (text, metadata) or
         (None, {}) if backend is unavailable or errors out (caller falls
         back to echo)."""
-        if self._backend is None:
+        # Snapshot the backend reference once per request — stop() may
+        # null out self._backend concurrently; this prevents a NoneType
+        # dereference between the check below and the .generate() call.
+        backend = self._backend
+        if backend is None:
             return None, {}
 
         # Compose backend messages: pack system prompt + user-provided messages
@@ -700,7 +736,7 @@ class Emulator(ServiceEmulator):
         params = self._merge_gen_params(request)
 
         try:
-            result: GenerationResult = self._backend.generate(
+            result: GenerationResult = backend.generate(
                 messages=backend_messages, params=params
             )
         except Exception as e:  # noqa: BLE001
@@ -709,7 +745,7 @@ class Emulator(ServiceEmulator):
                 extra={
                     "service": self.name,
                     "payload": {
-                        "backend": self._backend.name,
+                        "backend": backend.name,
                         "error": f"{type(e).__name__}: {e}",
                         "route": route,
                     },
@@ -721,7 +757,7 @@ class Emulator(ServiceEmulator):
                 source_port=source_port,
                 action="backend_error",
                 message="vuln-llm backend invocation failed",
-                payload={"backend": self._backend.name, "error": type(e).__name__},
+                payload={"backend": backend.name, "error": type(e).__name__},
             )
             return None, {}
 
@@ -810,6 +846,8 @@ class Emulator(ServiceEmulator):
             return
         # Session bookkeeping (best-effort; if session_manager has different
         # API surface in the running runtime, log the event anyway).
+        # Failure here is rare but visible — log at WARNING so degraded
+        # session storage doesn't silently drop intel.
         try:
             self.runtime.session_manager.get_or_create(
                 session_id=session_id, source_ip=source_ip
@@ -820,10 +858,14 @@ class Emulator(ServiceEmulator):
                 action=action,
                 payload=payload,
             )
-        except Exception:
-            self.logger.debug(
+        except Exception as e:  # noqa: BLE001
+            self.logger.warning(
                 "session_manager call failed; continuing with event_logger only",
-                extra={"service": self.name, "action": action},
+                extra={
+                    "service": self.name,
+                    "action": action,
+                    "payload": {"error": f"{type(e).__name__}: {e}"},
+                },
             )
         self.runtime.event_logger.emit(
             message=message,

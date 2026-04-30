@@ -49,10 +49,19 @@ def _ensure_dummy_pack_built() -> Path:
 def test_round_trip_open_and_verify() -> None:
     pack = _ensure_dummy_pack_built()
     with PackReader.open(pack) as reader:
-        assert reader.manifest().pack.id == "dummy-pack"
-        assert reader.manifest().pack.version == "0.1.0"
+        # Pre-verify: only unverified_manifest() is allowed.
+        assert reader.unverified_manifest().pack.id == "dummy-pack"
+        assert reader.unverified_manifest().pack.version == "0.1.0"
+        # Pre-verify: manifest() and read_file() are gated.
+        with pytest.raises(PackError, match="before verify"):
+            reader.manifest()
+        with pytest.raises(PackError, match="before verify"):
+            reader.read_file("manifest.toml")
         # cp_version 0.1.0 is in the dummy pack's range (0.1.0 .. 0.x)
         reader.verify(TrustStore.default(), cp_version="0.1.0")
+        # Post-verify: now manifest() and read_file() work.
+        assert reader.manifest().pack.id == "dummy-pack"
+        assert reader.read_file("manifest.toml")
 
 
 # ---------- M1-009: tamper manifest ----------

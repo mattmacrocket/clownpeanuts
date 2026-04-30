@@ -239,6 +239,7 @@ def test_hosted_connection_error_returns_error_result() -> None:
 def test_factory_picks_stub_for_stub_manifest() -> None:
     pack = _ensure_pack()
     with PackReader.open(pack) as reader:
+        reader.verify(TrustStore.default())
         m = reader.manifest()
         assert m.runtime.inference_backend == "stub"
         b = get_backend(manifest=m, pack_dir=reader.work_path())
@@ -249,6 +250,7 @@ def test_factory_rejects_hosted_without_endpoint() -> None:
     """If manifest says hosted but service config is missing endpoint, error."""
     pack = _ensure_pack()
     with PackReader.open(pack) as reader:
+        reader.verify(TrustStore.default())
         m = reader.manifest()
         # Force-build a manifest variant claiming hosted (we test the
         # factory's config-validation, not the manifest itself)
@@ -266,6 +268,7 @@ def test_factory_rejects_hosted_without_endpoint() -> None:
 def test_factory_passes_hosted_config(openai_mock: str) -> None:
     pack = _ensure_pack()
     with PackReader.open(pack) as reader:
+        reader.verify(TrustStore.default())
         from dataclasses import replace
 
         m = reader.manifest()

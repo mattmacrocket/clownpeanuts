@@ -27,14 +27,27 @@ _TECHNIQUE_CATALOG: tuple[dict[str, str], ...] = (
     {"technique_id": "T1041", "technique_name": "Exfiltration Over C2 Channel", "tactic": "Exfiltration"},
     # LLM attack mappings (HDL vuln_llm service). Cross-walk:
     #   classifier_result(jailbreak_attempt | exploit_chain) → T1190
+    #     + AML.T0051 (LLM Prompt Injection, MITRE ATLAS)
+    #     + AML.T0054 (LLM Jailbreak, MITRE ATLAS) for exploit_chain
     #   tool_called(execute_query)                          → T1059
     #   tool_called(read_file)                              → T1005
     #   tool_called(list_secrets)                           → T1552
     #   tool_called(query_user_db)                          → T1213
-    #   canary_issued(*)                                    → T1606
+    #
+    # Note: canary_issued is intentionally NOT mapped to T1606
+    # ("Forge Web Credentials"). T1606 describes the ADVERSARY forging
+    # credentials. Here the DEFENDER forges canaries to hand to the
+    # attacker. The matching adversary action (T1078 Valid Accounts)
+    # would only fire when the adversary later USES the canary
+    # somewhere else — and we don't observe that in this loop. The
+    # downstream canary-hit pipeline is the right place for it.
     {"technique_id": "T1552", "technique_name": "Unsecured Credentials", "tactic": "Credential Access"},
     {"technique_id": "T1213", "technique_name": "Data from Information Repositories", "tactic": "Collection"},
-    {"technique_id": "T1606", "technique_name": "Forge Web Credentials", "tactic": "Credential Access"},
+    # MITRE ATLAS — community-maintained ATT&CK extension for ML/AI systems.
+    # IDs use the AML.* namespace and are intentionally separate from the
+    # T#### catalog so they are still distinguishable in coverage reports.
+    {"technique_id": "AML.T0051", "technique_name": "LLM Prompt Injection", "tactic": "Initial Access"},
+    {"technique_id": "AML.T0054", "technique_name": "LLM Jailbreak", "tactic": "Defense Evasion"},
 )
 
 
@@ -247,6 +260,15 @@ def _map_vuln_llm_event(
                     confidence=0.78 if label == "exploit_chain" else 0.62,
                 )
             )
+            # MITRE ATLAS: prompt injection is the ML-specific framing.
+            matches.append(
+                TechniqueMatch(
+                    technique_id="AML.T0051",
+                    technique_name="LLM Prompt Injection",
+                    tactic="Initial Access",
+                    confidence=0.85 if label == "exploit_chain" else 0.70,
+                )
+            )
         if label == "exploit_chain":
             # Multi-stage chains imply the attacker is also trying scripted
             # execution against the model's tool surface.
@@ -256,6 +278,16 @@ def _map_vuln_llm_event(
                     technique_name="Command and Scripting Interpreter",
                     tactic="Execution",
                     confidence=0.55,
+                )
+            )
+            # MITRE ATLAS: jailbreak (multi-step pattern: DAN, refusal
+            # bypass, role-play coercion, etc.).
+            matches.append(
+                TechniqueMatch(
+                    technique_id="AML.T0054",
+                    technique_name="LLM Jailbreak",
+                    tactic="Defense Evasion",
+                    confidence=0.80,
                 )
             )
 
@@ -298,17 +330,10 @@ def _map_vuln_llm_event(
                 )
             )
 
-    elif action == "canary_issued":
-        # Whenever a canary is handed to the attacker, they've now received
-        # a forged credential they think is real. Even if they don't use it
-        # in this session, capture the intent.
-        matches.append(
-            TechniqueMatch(
-                technique_id="T1606",
-                technique_name="Forge Web Credentials",
-                tactic="Credential Access",
-                confidence=0.50,
-            )
-        )
+    # canary_issued is a DEFENDER action (we forge a token to hand to the
+    # attacker). It does not map to any adversary technique here. The
+    # corresponding adversary technique (T1078 Valid Accounts, when the
+    # canary is later used somewhere else) is mapped by the downstream
+    # canary-hit pipeline, not here.
 
     return matches

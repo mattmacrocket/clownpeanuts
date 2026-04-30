@@ -255,8 +255,9 @@ def _synth_read_file(
     # Reject absolute Windows paths and obviously-injected content
     path = raw_path.replace("\\", "/")
 
-    # Stable result for repeated reads in the same session
-    cached = world.file_cache.get(path)
+    # Stable result for repeated reads in the same session.
+    # Uses the bounded cache accessor (LRU-evicted to bound memory).
+    cached = world.cached_file(path)
     if cached is not None:
         return ToolResponse(text=cached, latency_ms=60)
 
@@ -300,7 +301,7 @@ def _synth_read_file(
             failed=True,
         )
 
-    world.file_cache[path] = body
+    world.cache_file(path, body)
     return ToolResponse(text=body, issued_tokens=tuple(issued), latency_ms=110)
 
 

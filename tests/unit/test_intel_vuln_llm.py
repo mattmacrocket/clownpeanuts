@@ -38,7 +38,7 @@ def test_classifier_benign_yields_no_techniques() -> None:
     assert matches == []
 
 
-def test_classifier_jailbreak_attempt_maps_to_t1190() -> None:
+def test_classifier_jailbreak_attempt_maps_to_t1190_and_atlas() -> None:
     matches = map_event_to_techniques(
         {
             "service": "vuln_llm",
@@ -50,12 +50,17 @@ def test_classifier_jailbreak_attempt_maps_to_t1190() -> None:
             },
         }
     )
-    assert "T1190" in _ids(matches)
-    # Should NOT include T1059 for plain jailbreak_attempt
-    assert "T1059" not in _ids(matches)
+    ids = _ids(matches)
+    assert "T1190" in ids
+    # MITRE ATLAS prompt-injection technique fires for any jailbreak verdict.
+    assert "AML.T0051" in ids
+    # Should NOT include T1059 / AML.T0054 for plain jailbreak_attempt;
+    # those are reserved for full exploit chains.
+    assert "T1059" not in ids
+    assert "AML.T0054" not in ids
 
 
-def test_classifier_exploit_chain_maps_to_t1190_plus_t1059() -> None:
+def test_classifier_exploit_chain_maps_to_full_set() -> None:
     matches = map_event_to_techniques(
         {
             "service": "vuln_llm",
@@ -64,16 +69,20 @@ def test_classifier_exploit_chain_maps_to_t1190_plus_t1059() -> None:
                 "label": "exploit_chain",
                 "score": 1.5,
                 "matched_rules": [
-                    "dan_prompt",
+                    "dan_pattern",
                     "system_prompt_extraction",
-                    "command_injection",
+                    "tool_exploit_marker",
                 ],
             },
         }
     )
     ids = _ids(matches)
+    # Standard ATT&CK
     assert "T1190" in ids
     assert "T1059" in ids
+    # MITRE ATLAS
+    assert "AML.T0051" in ids
+    assert "AML.T0054" in ids
     # Higher confidence on T1190 for exploit_chain than for jailbreak_attempt
     t1190 = next(m for m in matches if m.technique_id == "T1190")
     assert t1190.confidence >= 0.7
@@ -140,10 +149,16 @@ def test_tool_unknown_yields_no_match() -> None:
     assert matches == []
 
 
-# ---------- canary_issued ----------
+# ---------- canary_issued is a DEFENDER action — no mapping ----------
 
 
-def test_canary_issued_maps_to_t1606() -> None:
+def test_canary_issued_does_not_map_to_adversary_techniques() -> None:
+    """canary_issued is the DEFENDER forging tokens to hand to the
+    attacker. It must NOT appear in the ATT&CK adversary technique list
+    because the adversary hasn't done anything credential-access-y yet.
+    The corresponding adversary technique fires only when the canary is
+    later observed in use (T1078 Valid Accounts via the canary-hit
+    pipeline)."""
     matches = map_event_to_techniques(
         {
             "service": "vuln_llm",
@@ -155,7 +170,7 @@ def test_canary_issued_maps_to_t1606() -> None:
             },
         }
     )
-    assert "T1606" in _ids(matches)
+    assert matches == []
 
 
 # ---------- non-vuln_llm events should be unaffected ----------
@@ -215,28 +230,30 @@ def test_summarize_techniques_aggregates_vuln_llm_session() -> None:
     summary = summarize_techniques(events)
     ids = {item["technique_id"] for item in summary}
     # Every LLM-attack technique we mapped should appear in the summary
-    assert {"T1190", "T1059", "T1552", "T1606"} <= ids
-    # T1606 should have count=2 (two canary_issued events)
-    t1606 = next(item for item in summary if item["technique_id"] == "T1606")
-    assert t1606["count"] == 2
+    assert {"T1190", "T1059", "T1552", "AML.T0051", "AML.T0054"} <= ids
+    # canary_issued must NOT appear (defender action, see test above)
+    assert "T1606" not in ids
+    # AML.T0051 fires on every jailbreak/exploit verdict (2 events)
+    atlas = next(item for item in summary if item["technique_id"] == "AML.T0051")
+    assert atlas["count"] == 2
 
 
 def test_summarize_coverage_includes_new_techniques() -> None:
-    """The new T1552/T1213/T1606 entries must be in the catalog so coverage
-    counts them correctly."""
+    """The new T1552/T1213/AML.T0051/AML.T0054 catalog entries must be
+    counted in coverage."""
     coverage = summarize_coverage(
         [
             {"technique_id": "T1552", "technique_name": "Unsecured Credentials",
              "tactic": "Credential Access", "count": 1, "confidence": 0.9},
-            {"technique_id": "T1606", "technique_name": "Forge Web Credentials",
-             "tactic": "Credential Access", "count": 1, "confidence": 0.5},
+            {"technique_id": "AML.T0051", "technique_name": "LLM Prompt Injection",
+             "tactic": "Initial Access", "count": 1, "confidence": 0.7},
         ]
     )
     ids = {item["technique_id"] for item in coverage["observed"]}
     assert "T1552" in ids
-    assert "T1606" in ids
-    # The new entries expand the catalog from 9 → 12
-    assert coverage["catalog_size"] == 12
+    assert "AML.T0051" in ids
+    # 9 ATT&CK + T1552 + T1213 + AML.T0051 + AML.T0054 = 13
+    assert coverage["catalog_size"] == 13
 
 
 # ---------- LLM-attack tool fingerprints ----------

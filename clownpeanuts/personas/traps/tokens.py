@@ -15,7 +15,8 @@ Spec: hueydeweylouie/docs/HUEYDEWEYLOUIE-SPEC.md §5.1.
 from __future__ import annotations
 
 import re
-from collections import defaultdict
+import threading
+from collections import OrderedDict
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -26,6 +27,10 @@ from clownpeanuts.intel.canary import generate_canary_token
 
 VALID_CANARY_TYPES = frozenset({"dns", "http", "email", "aws", "code"})
 VALID_CARDINALITIES = frozenset({"per_session", "per_pack_install", "per_request"})
+
+# Bound the per-session cache so a flood of unique session_ids cannot
+# exhaust memory. Eviction is LRU: oldest session bucket is dropped.
+_MAX_SESSION_BUCKETS = 4096
 
 # Default render templates per canary type. Substitution placeholders
 # `{token}` and `{artifact.<field>}` resolve at issuance.
@@ -75,16 +80,22 @@ class TokenFactory:
         templates: list[TokenTemplate],
         *,
         namespace: str = "hdl",
+        max_session_buckets: int = _MAX_SESSION_BUCKETS,
     ) -> None:
         self._templates: dict[str, TokenTemplate] = {t.id: t for t in templates}
         self._namespace = namespace
+        self._max_session_buckets = max(1, int(max_session_buckets))
 
         # Cardinality state:
-        # per_session: session_id -> template_id -> IssuedToken
+        # per_session: session_id -> template_id -> IssuedToken (LRU-evicted)
         # per_pack_install: template_id -> IssuedToken
         # per_request: never cached
-        self._session_cache: dict[str, dict[str, IssuedToken]] = defaultdict(dict)
+        # OrderedDict gives O(1) move-to-end; popitem(last=False) evicts oldest.
+        self._session_cache: OrderedDict[str, dict[str, IssuedToken]] = OrderedDict()
         self._install_cache: dict[str, IssuedToken] = {}
+        # Single lock guards all mutable state. issue() is short-running
+        # so contention is minimal even under threaded request load.
+        self._lock = threading.Lock()
 
     @classmethod
     def from_pack(
@@ -136,7 +147,11 @@ class TokenFactory:
         return list(self._templates.keys())
 
     def issue(self, template_id: str, *, session_id: str) -> IssuedToken:
-        """Issue (or fetch cached) a token for a given template + session."""
+        """Issue (or fetch cached) a token for a given template + session.
+
+        Thread-safe: a single lock serializes cache reads + mutations.
+        Session buckets are LRU-evicted at `max_session_buckets`.
+        """
         template = self._templates.get(template_id)
         if template is None:
             raise TokenFactoryError(
@@ -144,24 +159,35 @@ class TokenFactory:
                 f"(known: {sorted(self._templates.keys())})"
             )
 
-        if template.cardinality == "per_session":
-            cached = self._session_cache[session_id].get(template_id)
-            if cached is not None:
-                return cached
-            issued = self._issue_new(template)
-            self._session_cache[session_id][template_id] = issued
-            return issued
+        with self._lock:
+            if template.cardinality == "per_session":
+                bucket = self._session_cache.get(session_id)
+                if bucket is None:
+                    bucket = {}
+                    self._session_cache[session_id] = bucket
+                else:
+                    # touch — move to most-recently-used
+                    self._session_cache.move_to_end(session_id)
+                cached = bucket.get(template_id)
+                if cached is not None:
+                    return cached
+                issued = self._issue_new(template)
+                bucket[template_id] = issued
+                # LRU evict if over cap
+                while len(self._session_cache) > self._max_session_buckets:
+                    self._session_cache.popitem(last=False)
+                return issued
 
-        if template.cardinality == "per_pack_install":
-            cached = self._install_cache.get(template_id)
-            if cached is not None:
-                return cached
-            issued = self._issue_new(template)
-            self._install_cache[template_id] = issued
-            return issued
+            if template.cardinality == "per_pack_install":
+                cached = self._install_cache.get(template_id)
+                if cached is not None:
+                    return cached
+                issued = self._issue_new(template)
+                self._install_cache[template_id] = issued
+                return issued
 
-        # per_request: always fresh
-        return self._issue_new(template)
+            # per_request: always fresh, no cache write
+            return self._issue_new(template)
 
     def _issue_new(self, template: TokenTemplate) -> IssuedToken:
         canary = generate_canary_token(

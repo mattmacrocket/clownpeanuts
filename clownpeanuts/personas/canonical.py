@@ -22,8 +22,38 @@ EXCLUDED_PATHS: frozenset[str] = frozenset({"pack.sig"})
 
 
 def canonical_bytes(pack_dir: Path) -> bytes:
-    """Return the byte-exact canonical content for a pack source/extracted dir."""
+    """Return the byte-exact canonical content for a pack source/extracted dir.
+
+    Reads files from disk. Used by the writer (build_pack.py) and by
+    legacy callers. The verifier path uses
+    `canonical_bytes_from_snapshot()` instead so verification is
+    independent of post-extract disk state (TOCTOU guard).
+    """
     files = _collect_files(pack_dir, pack_dir)
+    return _serialize_canonical(files)
+
+
+def canonical_bytes_from_snapshot(snapshot: dict[str, bytes]) -> bytes:
+    """Return the byte-exact canonical content from an in-memory snapshot.
+
+    `snapshot` keys are forward-slash relative paths (as produced by
+    PackReader._load_snapshot). `pack.sig` is excluded; everything else
+    contributes one `{"path": "...", "sha256": "..."}` entry sorted
+    lexicographically by path.
+
+    This is the verifier-side entry point. The writer uses
+    `canonical_bytes(pack_dir)` (disk-walking) since the writer owns the
+    bytes anyway and TOCTOU is moot before signing.
+    """
+    files: list[tuple[str, bytes]] = []
+    for rel_path, content in snapshot.items():
+        if rel_path in EXCLUDED_PATHS:
+            continue
+        files.append((rel_path, content))
+    return _serialize_canonical(files)
+
+
+def _serialize_canonical(files: list[tuple[str, bytes]]) -> bytes:
     files.sort(key=lambda item: item[0])
 
     parts: list[str] = ['{"files":[']

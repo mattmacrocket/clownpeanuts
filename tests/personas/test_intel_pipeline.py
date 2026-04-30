@@ -190,12 +190,15 @@ def test_attacker_session_produces_llm_attack_intel_report() -> None:
         f"expected T1190 from jailbreak/exploit verdicts; got {technique_ids}"
     )
 
-    # If a canary was issued, T1606 must appear
-    canary_events = [ev for ev in session["events"] if ev["action"] == "canary_issued"]
-    if canary_events:
-        assert "T1606" in technique_ids, (
-            f"canary_issued events present but T1606 missing; got {technique_ids}"
-        )
+    # MITRE ATLAS prompt-injection technique fires for any jailbreak verdict.
+    assert "AML.T0051" in technique_ids, (
+        f"expected AML.T0051 (LLM Prompt Injection); got {technique_ids}"
+    )
+
+    # canary_issued is a defender action — must NOT map to T1606. The
+    # spec mistakenly suggested T1606 for issuance; the correct adversary
+    # technique fires only when the canary is observed in use elsewhere.
+    assert "T1606" not in technique_ids
 
     # ----- LLM fingerprints -----
     session_report = report["sessions"][0]
@@ -208,8 +211,9 @@ def test_attacker_session_produces_llm_attack_intel_report() -> None:
         f"expected llm-prompt-extraction fingerprint; got {fp_tools}"
     )
 
-    # MITRE coverage must reflect the new catalog entries
-    assert report["coverage"]["catalog_size"] == 12
+    # MITRE coverage must reflect the new catalog entries:
+    # 9 baseline ATT&CK + T1552 + T1213 + AML.T0051 + AML.T0054 = 13
+    assert report["coverage"]["catalog_size"] == 13
     assert report["totals"]["mitre_coverage_percent"] > 0.0
 
 
@@ -232,7 +236,10 @@ def test_benign_only_session_produces_no_llm_techniques() -> None:
     report = build_intelligence_report(sessions)
     technique_ids = {item["technique_id"] for item in report["techniques"]}
     # None of the LLM-attack techniques should fire on benign-only sessions
-    llm_attack_ids = {"T1190", "T1059", "T1552", "T1213", "T1606", "T1005"}
+    llm_attack_ids = {
+        "T1190", "T1059", "T1552", "T1213", "T1005",
+        "AML.T0051", "AML.T0054",
+    }
     leaked = technique_ids & llm_attack_ids
     assert leaked == set(), (
         f"benign session mistakenly mapped to attack techniques: {leaked}"

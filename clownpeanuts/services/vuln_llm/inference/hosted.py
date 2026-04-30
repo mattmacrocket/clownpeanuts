@@ -17,12 +17,38 @@ import time
 from typing import Any
 from urllib import request as urlrequest
 from urllib.error import HTTPError, URLError
+from urllib.parse import urlparse
 
 from clownpeanuts.services.vuln_llm.inference.base import (
     Backend,
     GenerationParams,
     GenerationResult,
 )
+
+# Only http/https are allowed for hosted-backend endpoints. Without an
+# allowlist, urllib will happily open file:// URLs (local file
+# disclosure), ftp://, and so on. An attacker who can influence service
+# config (env, secret store, etc.) could otherwise pivot the service
+# into reading local files or arbitrary protocols.
+_ALLOWED_SCHEMES = frozenset({"http", "https"})
+
+
+class _NoRedirectHandler(urlrequest.HTTPRedirectHandler):
+    """Reject all HTTP redirects.
+
+    A malicious or compromised hosted endpoint could 302 the request to
+    an attacker-controlled host, exfiltrating prompts. Better to fail
+    closed and let the operator update the configured endpoint.
+    """
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):  # type: ignore[override]
+        raise URLError(
+            f"hosted endpoint attempted redirect to {newurl!r} "
+            f"(code {code}); refusing for safety"
+        )
+
+
+_OPENER = urlrequest.build_opener(_NoRedirectHandler())
 
 
 class HostedBackend(Backend):
@@ -43,6 +69,18 @@ class HostedBackend(Backend):
         if provider not in ("openai", "ollama"):
             raise ValueError(
                 f"HostedBackend: provider must be 'openai' or 'ollama', got '{provider}'"
+            )
+        # Reject non-http(s) schemes at construction time so misconfigured
+        # endpoints fail fast at service start, not on first request.
+        parsed = urlparse(endpoint)
+        if parsed.scheme not in _ALLOWED_SCHEMES:
+            raise ValueError(
+                f"HostedBackend: endpoint scheme must be one of "
+                f"{sorted(_ALLOWED_SCHEMES)}, got '{parsed.scheme}'"
+            )
+        if not parsed.netloc:
+            raise ValueError(
+                f"HostedBackend: endpoint has no host: {endpoint!r}"
             )
         self._endpoint = endpoint
         self._provider = provider
@@ -74,7 +112,8 @@ class HostedBackend(Backend):
         )
 
         try:
-            with urlrequest.urlopen(req, timeout=self._timeout) as resp:
+            # Use the no-redirect opener so 302→evil-host is impossible.
+            with _OPENER.open(req, timeout=self._timeout) as resp:
                 response_bytes = resp.read(self._max_bytes)
         except HTTPError as e:
             return self._error_result(

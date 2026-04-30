@@ -5,9 +5,11 @@ For dev builds, the embedded key is the dev-root key from
 `hueydeweylouie/examples/dev-keys/dev-root.pub.hex`. Production builds
 substitute the real root pubkey at release time.
 
-In dev/test runs, the embedded key can be overridden via the
-`CP_HDL_ROOT_PUBKEY` env var (64-char hex). Production releases should
-NOT honor this override — gate it on a separate dev flag if you keep it.
+In dev/test runs only, the embedded key can be overridden via the
+`CP_HDL_ROOT_PUBKEY` env var (64-char hex). The override is gated on
+`CP_HDL_DEV_TRUST=1` — without that flag set, the env override is
+silently ignored. This keeps production deployments from being subverted
+by an attacker who can set environment variables.
 
 Spec: hueydeweylouie/docs/HUEYDEWEYLOUIE-SPEC.md §8.
 """
@@ -47,9 +49,19 @@ class TrustStore:
 
     @classmethod
     def default(cls) -> "TrustStore":
-        """Construct with the embedded root pubkey (dev override allowed)."""
-        env_override = os.environ.get("CP_HDL_ROOT_PUBKEY")
-        hex_str = (env_override or _EMBEDDED_DEV_ROOT_PUBKEY_HEX).strip()
+        """Construct with the embedded root pubkey.
+
+        The CP_HDL_ROOT_PUBKEY env override is honored ONLY when
+        CP_HDL_DEV_TRUST=1 is also set in the environment. In a
+        production deployment the override is silently ignored even if
+        an attacker manages to set CP_HDL_ROOT_PUBKEY.
+        """
+        hex_str = _EMBEDDED_DEV_ROOT_PUBKEY_HEX
+        if os.environ.get("CP_HDL_DEV_TRUST") == "1":
+            env_override = os.environ.get("CP_HDL_ROOT_PUBKEY", "").strip()
+            if env_override:
+                hex_str = env_override
+        hex_str = hex_str.strip()
         if len(hex_str) != 64:
             raise SignatureError(
                 f"root pubkey hex must be 64 chars, got {len(hex_str)}"

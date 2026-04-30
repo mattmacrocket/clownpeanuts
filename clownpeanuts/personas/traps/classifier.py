@@ -77,7 +77,22 @@ class HeuristicClassifier:
             )
         return cls(rules=rules, threshold=threshold)
 
+    # Hard cap on the input length passed to regex engines. Python's
+    # `re` module has no per-match timeout; pathological patterns over
+    # very long inputs can hang a worker thread indefinitely (ReDoS).
+    # 8 KiB is generous for legitimate prompt-injection attempts and
+    # leaves the remaining 248 KiB of the 256 KiB body cap unmatched.
+    MAX_INPUT_CHARS = 8 * 1024
+
     def classify(self, text: str) -> ClassifierVerdict:
+        # Truncate before regex matching to bound worst-case backtracking
+        # cost across all rules. Truncation mid-input is fine for our
+        # heuristics: if a jailbreak doesn't fit in the first 8 KiB the
+        # backend will see the full input anyway, and the routing is
+        # already conservative.
+        if len(text) > self.MAX_INPUT_CHARS:
+            text = text[: self.MAX_INPUT_CHARS]
+
         score = 0.0
         matched: list[str] = []
         for rule in self.rules:
