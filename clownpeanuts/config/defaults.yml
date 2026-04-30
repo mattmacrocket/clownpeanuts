@@ -306,3 +306,15 @@ services:
     ports: [2022]
     config:
       greeting: "welcome to clownpeanuts"
+  # HueyDeweyLouie — fake LLM endpoint deception service.
+  # M0: echoes the last user message back via OpenAI-compatible API.
+  # M1+: loads signed .hdl persona packs with trained LoRAs, classifier, and trap layer.
+  # Spec: hueydeweylouie/docs/HUEYDEWEYLOUIE-SPEC.md
+  - name: vuln-llm
+    module: clownpeanuts.services.vuln_llm.emulator
+    enabled: false
+    listen_host: 0.0.0.0
+    ports: [8000]
+    config:
+      max_concurrent_connections: 128
+      model_name: "vuln-llm-endpoint-v0.1.0"
