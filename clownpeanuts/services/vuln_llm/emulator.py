@@ -29,6 +29,13 @@ from clownpeanuts.personas.reader import PackError, PackReader
 from clownpeanuts.personas.traps.layer import RouteDecision, TrapLayer
 from clownpeanuts.personas.trust import TrustStore
 from clownpeanuts.services.base import ServiceEmulator
+from clownpeanuts.services.vuln_llm.inference import (
+    Backend,
+    BackendInitError,
+    GenerationParams,
+    GenerationResult,
+    get_backend,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -91,6 +98,9 @@ class Emulator(ServiceEmulator):
         # Pack-loading state. Populated in start() if pack_path is configured.
         self._pack_reader: PackReader | None = None
         self._trap_layer: TrapLayer | None = None
+        self._backend: Backend | None = None
+        self._system_prompt: str = ""
+        self._gen_defaults: GenerationParams = GenerationParams()
         # Per-session turn counter for canary template rotation.
         self._turn_counter: dict[str, int] = defaultdict(int)
         self._turn_counter_lock = threading.Lock()
@@ -174,6 +184,12 @@ class Emulator(ServiceEmulator):
         if self._thread is not None:
             self._thread.join(timeout=2.0)
             self._thread = None
+        if self._backend is not None:
+            try:
+                self._backend.close()
+            except Exception:  # noqa: BLE001
+                pass
+            self._backend = None
         if self._pack_reader is not None:
             self._pack_reader.close()
             self._pack_reader = None
@@ -226,8 +242,52 @@ class Emulator(ServiceEmulator):
             reader.close()
             return
 
+        # Construct the inference backend per manifest. Failure falls back
+        # to no-backend (echo via passthrough) rather than refusing to start.
+        cfg = self._config.config if self._config else {}
+        try:
+            backend = get_backend(
+                manifest=manifest,
+                pack_dir=reader.work_path(),
+                service_config=cfg,
+            )
+            backend_name = backend.name
+        except BackendInitError as e:
+            self.logger.error(
+                "vuln-llm backend init failed; passthrough will fall back to echo",
+                extra={
+                    "service": self.name,
+                    "payload": {
+                        "backend": manifest.runtime.inference_backend,
+                        "error": str(e),
+                    },
+                },
+            )
+            backend = None
+            backend_name = "(none)"
+
+        # Load the system prompt from the pack
+        system_prompt = ""
+        try:
+            sp_rel = manifest.entrypoints.system_prompt
+            if sp_rel:
+                system_prompt = (reader.work_path() / sp_rel).read_text(encoding="utf-8")
+        except Exception:  # noqa: BLE001
+            pass
+
+        # Default generation params from manifest
+        gen = manifest.generation
+        self._gen_defaults = GenerationParams(
+            temperature=gen.temperature,
+            top_p=gen.top_p,
+            max_tokens=gen.max_tokens,
+            stop=tuple(gen.stop),
+        )
+
         self._pack_reader = reader
         self._trap_layer = trap
+        self._backend = backend
+        self._system_prompt = system_prompt
         self._model_name = f"{manifest.pack.id}-{manifest.pack.version}"
         self.logger.info(
             "vuln-llm pack loaded",
@@ -237,9 +297,16 @@ class Emulator(ServiceEmulator):
                     "pack_id": manifest.pack.id,
                     "pack_version": manifest.pack.version,
                     "model_name": self._model_name,
+                    "backend": backend_name,
+                    "system_prompt_chars": len(system_prompt),
                     "token_templates": trap.tokens.template_ids(),
                     "canary_templates": len(trap.canaries),
                     "classifier_rules": len(trap.classifier.rules),
+                    "gen_defaults": {
+                        "temperature": self._gen_defaults.temperature,
+                        "top_p": self._gen_defaults.top_p,
+                        "max_tokens": self._gen_defaults.max_tokens,
+                    },
                 },
             },
         )
@@ -398,6 +465,8 @@ class Emulator(ServiceEmulator):
             source_port=source_port,
             turn_n=turn_n,
             last_user_text=last_user_content,
+            messages=messages,
+            request=request,
         )
 
         # Build OpenAI-compatible response.
@@ -465,12 +534,17 @@ class Emulator(ServiceEmulator):
         source_port: int,
         turn_n: int,
         last_user_text: str,
+        messages: list[dict[str, Any]],
+        request: dict[str, Any],
     ) -> tuple[str, dict[str, Any]]:
         """Return (assistant_content, route_metadata).
 
-        If trap layer is loaded, route through classifier → canary templates.
-        Otherwise, echo the user message back (M0 behavior; useful for smoke
-        tests when no pack is configured).
+        Routing matrix:
+        - canary_response → existing canary template (predictable trap)
+        - tool_response → existing tool synthesizer (deterministic state)
+        - passthrough/escalate_probing → backend.generate() if loaded,
+          else echo (M0 fallback)
+        - echo (no pack loaded) → echo
         """
         if self._trap_layer is None:
             return last_user_text, {"route": "echo"}
@@ -559,21 +633,147 @@ class Emulator(ServiceEmulator):
                 "latency_ms": decision.latency_ms,
             }
 
-        if decision.action == "escalate_probing":
-            # M2 minimum: probing falls through to echo (Tier-2 prompt
-            # template work lives in M3+ alongside inference).
-            return last_user_text, {
-                "route": "probing_echo",
+        if decision.action in ("escalate_probing", "passthrough"):
+            # Try the inference backend if loaded; fall back to echo on any
+            # failure (logged but not exposed to the attacker as an error).
+            text, gen_meta = self._invoke_backend(
+                session_id=session_id,
+                source_ip=source_ip,
+                source_port=source_port,
+                messages=messages,
+                request=request,
+                route=decision.action,
+            )
+            if text is None:
+                # Backend not loaded or failed — fall back to echo
+                return last_user_text, {
+                    "route": f"{decision.action}_echo",
+                    "verdict": decision.verdict.label,
+                    "score": decision.verdict.score,
+                }
+            return text, {
+                "route": decision.action,
                 "verdict": decision.verdict.label,
                 "score": decision.verdict.score,
+                **gen_meta,
             }
 
-        # passthrough
+        # Unknown action — defensive fallback (shouldn't reach here)
         return last_user_text, {
-            "route": "passthrough",
+            "route": "passthrough_echo",
             "verdict": decision.verdict.label,
             "score": decision.verdict.score,
         }
+
+    def _invoke_backend(
+        self,
+        *,
+        session_id: str,
+        source_ip: str,
+        source_port: int,
+        messages: list[dict[str, Any]],
+        request: dict[str, Any],
+        route: str,
+    ) -> tuple[str | None, dict[str, Any]]:
+        """Run the loaded inference backend. Returns (text, metadata) or
+        (None, {}) if backend is unavailable or errors out (caller falls
+        back to echo)."""
+        if self._backend is None:
+            return None, {}
+
+        # Compose backend messages: pack system prompt + user-provided messages
+        backend_messages: list[dict[str, Any]] = []
+        if self._system_prompt:
+            backend_messages.append(
+                {"role": "system", "content": self._system_prompt}
+            )
+        for m in messages:
+            if isinstance(m, dict) and isinstance(m.get("role"), str):
+                backend_messages.append(
+                    {
+                        "role": str(m["role"]),
+                        "content": str(m.get("content", "")),
+                    }
+                )
+
+        # Build params: manifest defaults overridden by request body fields
+        params = self._merge_gen_params(request)
+
+        try:
+            result: GenerationResult = self._backend.generate(
+                messages=backend_messages, params=params
+            )
+        except Exception as e:  # noqa: BLE001
+            self.logger.error(
+                "vuln-llm backend.generate raised; falling back to echo",
+                extra={
+                    "service": self.name,
+                    "payload": {
+                        "backend": self._backend.name,
+                        "error": f"{type(e).__name__}: {e}",
+                        "route": route,
+                    },
+                },
+            )
+            self._emit_session_event(
+                session_id=session_id,
+                source_ip=source_ip,
+                source_port=source_port,
+                action="backend_error",
+                message="vuln-llm backend invocation failed",
+                payload={"backend": self._backend.name, "error": type(e).__name__},
+            )
+            return None, {}
+
+        if result.finish_reason == "error" or not result.text.strip():
+            self.logger.warning(
+                "vuln-llm backend returned error/empty; falling back to echo",
+                extra={
+                    "service": self.name,
+                    "payload": {
+                        "backend": result.backend,
+                        "finish_reason": result.finish_reason,
+                        "error": result.error,
+                    },
+                },
+            )
+            self._emit_session_event(
+                session_id=session_id,
+                source_ip=source_ip,
+                source_port=source_port,
+                action="backend_error",
+                message="vuln-llm backend returned no usable text",
+                payload={
+                    "backend": result.backend,
+                    "finish_reason": result.finish_reason,
+                    "error": result.error,
+                },
+            )
+            return None, {}
+
+        return result.text, {
+            "backend": result.backend,
+            "finish_reason": result.finish_reason,
+            "backend_prompt_tokens": result.prompt_tokens,
+            "backend_completion_tokens": result.completion_tokens,
+            "latency_to_first_token_ms": result.latency_to_first_token_ms,
+        }
+
+    def _merge_gen_params(self, request: dict[str, Any]) -> GenerationParams:
+        """Build GenerationParams: manifest defaults, with per-request overrides."""
+        defaults = self._gen_defaults
+        temp = request.get("temperature")
+        top_p = request.get("top_p")
+        max_t = request.get("max_tokens")
+        stop = request.get("stop")
+        seed = request.get("seed")
+        return GenerationParams(
+            temperature=float(temp) if isinstance(temp, (int, float)) else defaults.temperature,
+            top_p=float(top_p) if isinstance(top_p, (int, float)) else defaults.top_p,
+            max_tokens=int(max_t) if isinstance(max_t, int) else defaults.max_tokens,
+            stop=tuple(stop) if isinstance(stop, list) else defaults.stop,
+            seed=int(seed) if isinstance(seed, int) else None,
+        )
 
     # ------- Helpers -------
 

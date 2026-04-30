@@ -66,12 +66,23 @@ class EntrypointsMeta:
 
 
 @dataclass(frozen=True, slots=True)
+class GenerationMeta:
+    """Default generation parameters. Optional manifest section."""
+
+    temperature: float = 0.7
+    top_p: float = 0.95
+    max_tokens: int = 512
+    stop: tuple[str, ...] = ()
+
+
+@dataclass(frozen=True, slots=True)
 class PackManifest:
     pack: PackMeta
     engine: EngineMeta
     model: ModelMeta
     runtime: RuntimeMeta
     entrypoints: EntrypointsMeta
+    generation: GenerationMeta = GenerationMeta()
 
     @classmethod
     def from_toml_bytes(cls, data: bytes) -> "PackManifest":
@@ -143,10 +154,25 @@ class PackManifest:
         except KeyError as e:
             raise ManifestError(f"manifest missing required field: {e}") from e
 
+        gen_d = doc.get("generation", {}) or {}
+        generation = GenerationMeta(
+            temperature=float(gen_d.get("temperature", 0.7)),
+            top_p=float(gen_d.get("top_p", 0.95)),
+            max_tokens=int(gen_d.get("max_tokens", 512)),
+            stop=tuple(str(s) for s in (gen_d.get("stop", []) or [])),
+        )
+
         _ = _max_version_to_upper_bound(engine.clownpeanuts_max_version)
         _ = _parse_version(engine.clownpeanuts_min_version)
 
-        return cls(pack=pack, engine=engine, model=model, runtime=runtime, entrypoints=entrypoints)
+        return cls(
+            pack=pack,
+            engine=engine,
+            model=model,
+            runtime=runtime,
+            entrypoints=entrypoints,
+            generation=generation,
+        )
 
 
 _VERSION_RE = re.compile(r"^(\d+)\.(\d+)\.(\d+)$")
