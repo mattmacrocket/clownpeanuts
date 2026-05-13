@@ -45,6 +45,59 @@ class ClassifierVerdict:
     matched_rules: tuple[str, ...]
 
 
+def _compile_rules(
+    raw_rules: list[dict],
+    *,
+    source: str,
+    name_prefix: str,
+) -> list[HeuristicRule]:
+    """Compile a list of raw rule dicts into `HeuristicRule` objects.
+
+    `source` ("pack" or "operator") is woven into error messages so
+    misconfigured operator rules don't get blamed on the pack and
+    vice-versa. `name_prefix` (e.g. "tenant:") is prepended to the
+    compiled rule names so attribution in `matched_rules` output is
+    unambiguous.
+
+    Validation:
+    - `name` and `regex` are required
+    - regex must compile (re.error → ValueError naming the rule)
+    - score must be a float in (0.0, 1.0]; out-of-range is a hard error
+    """
+    out: list[HeuristicRule] = []
+    for raw in raw_rules:
+        if not isinstance(raw, dict):
+            raise ValueError(
+                f"{source} classifier rule is not a mapping: {raw!r}"
+            )
+        name = raw.get("name")
+        regex = raw.get("regex")
+        if not name or not regex:
+            raise ValueError(
+                f"{source} classifier rule missing required name/regex: {raw!r}"
+            )
+        try:
+            pattern = re.compile(regex)
+        except re.error as e:
+            raise ValueError(
+                f"{source} classifier rule {name!r}: bad regex: {e}"
+            ) from e
+        score = float(raw.get("score", 0.0))
+        if not (0.0 < score <= 1.0):
+            raise ValueError(
+                f"{source} classifier rule {name!r}: score must be in "
+                f"(0.0, 1.0], got {score}"
+            )
+        out.append(
+            HeuristicRule(
+                name=f"{name_prefix}{name}",
+                pattern=pattern,
+                score=score,
+            )
+        )
+    return out
+
+
 class HeuristicClassifier:
     DEFAULT_THRESHOLD = 0.5
 
@@ -59,38 +112,55 @@ class HeuristicClassifier:
         self.stage2 = stage2
 
     @classmethod
-    def from_pack(cls, pack_dir: Path) -> "HeuristicClassifier":
+    def from_pack(
+        cls,
+        pack_dir: Path,
+        *,
+        extra_rules: list[dict] | None = None,
+    ) -> "HeuristicClassifier":
+        """Build a classifier from the pack-shipped rules, optionally
+        appending operator-supplied `extra_rules` (X-018).
+
+        Operator rules are *additive*: they layer on top of the pack
+        rules and cannot disable them (by design — silencing pack rules
+        is high-risk for a vuln_llm deployment). Each operator rule
+        gets a `tenant:` name prefix so it's distinguishable from
+        pack rules in `matched_rules` output and in CP intel events.
+
+        Raises ValueError with the offending rule's name if any regex
+        won't compile or any score is out of (0.0, 1.0]. We hard-fail
+        at load time rather than at first-classify so operator config
+        problems surface at service-start, not at request-time.
+        """
         path = pack_dir / "traps" / "classifiers.yaml"
-        if not path.is_file():
-            return cls(
-                rules=[],
-                threshold=cls.DEFAULT_THRESHOLD,
-                stage2=Stage2Classifier.from_pack(pack_dir),
-            )
-
-        try:
-            doc = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
-        except yaml.YAMLError as e:
-            raise ValueError(f"classifiers.yaml parse error: {e}") from e
-
-        h = doc.get("heuristics", {}) or {}
-        threshold = float(h.get("threshold", cls.DEFAULT_THRESHOLD))
-
+        threshold: float = cls.DEFAULT_THRESHOLD
         rules: list[HeuristicRule] = []
-        for raw in h.get("rules", []) or []:
+
+        if path.is_file():
             try:
-                pattern = re.compile(raw["regex"])
-            except re.error as e:
-                raise ValueError(
-                    f"classifiers.yaml: bad regex in rule {raw.get('name', '?')}: {e}"
-                ) from e
-            rules.append(
-                HeuristicRule(
-                    name=str(raw["name"]),
-                    pattern=pattern,
-                    score=float(raw.get("score", 0.0)),
+                doc = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
+            except yaml.YAMLError as e:
+                raise ValueError(f"classifiers.yaml parse error: {e}") from e
+
+            h = doc.get("heuristics", {}) or {}
+            threshold = float(h.get("threshold", cls.DEFAULT_THRESHOLD))
+            rules.extend(
+                _compile_rules(
+                    h.get("rules", []) or [],
+                    source="pack",
+                    name_prefix="",
                 )
             )
+
+        if extra_rules:
+            rules.extend(
+                _compile_rules(
+                    extra_rules,
+                    source="operator",
+                    name_prefix="tenant:",
+                )
+            )
+
         return cls(
             rules=rules,
             threshold=threshold,

@@ -245,9 +245,22 @@ class Emulator(ServiceEmulator):
         # Use the pack's id as the canary namespace so issued tokens are
         # attributable to this persona deployment.
         namespace = self._sanitize_namespace(manifest.pack.id)
+        # Read operator config once — TrapLayer accepts a
+        # classifier_overrides mapping for X-018 per-tenant rule
+        # additions; the backend block also reads from cfg below.
+        cfg = self._config.config if self._config else {}
+        classifier_overrides = cfg.get("classifier_overrides")
         try:
-            trap = TrapLayer.from_pack(reader.work_path(), namespace=namespace)
+            trap = TrapLayer.from_pack(
+                reader.work_path(),
+                namespace=namespace,
+                classifier_overrides=classifier_overrides,
+            )
         except Exception as e:
+            # ValueError from a malformed operator rule lands here too.
+            # Fall back to echo mode rather than crashing the service —
+            # the error is logged with the rule context so operators
+            # can fix the config.
             self.logger.error(
                 "vuln-llm trap layer init failed; falling back to echo mode",
                 extra={"service": self.name, "payload": {"path": str(pack_path), "error": str(e)}},
@@ -255,9 +268,21 @@ class Emulator(ServiceEmulator):
             reader.close()
             return
 
+        if classifier_overrides:
+            n_extra = len(classifier_overrides.get("rules") or [])
+            self.logger.info(
+                "vuln-llm classifier overrides applied",
+                extra={
+                    "service": self.name,
+                    "payload": {
+                        "operator_rules": n_extra,
+                        "pack_rules": len(trap.classifier.rules) - n_extra,
+                    },
+                },
+            )
+
         # Construct the inference backend per manifest. Failure falls back
         # to no-backend (echo via passthrough) rather than refusing to start.
-        cfg = self._config.config if self._config else {}
         try:
             backend = get_backend(
                 manifest=manifest,

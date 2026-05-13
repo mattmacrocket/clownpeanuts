@@ -149,10 +149,27 @@ class TrapLayer:
         pack_dir: Path,
         *,
         namespace: str = "hdl",
+        classifier_overrides: dict | None = None,
     ) -> "TrapLayer":
+        """Build the trap layer from a pack directory.
+
+        `classifier_overrides` (X-018) is an optional operator-supplied
+        config dict that can add classifier rules on top of the
+        pack-shipped ones. Shape:
+
+            {"rules": [{"name": "...", "regex": "...", "score": 0.5}, ...]}
+
+        Additive only — operator rules cannot disable pack rules. See
+        `HeuristicClassifier.from_pack` for the merge + validation
+        semantics.
+        """
         token_factory = TokenFactory.from_pack(pack_dir, namespace=namespace)
+        extra_rules = (classifier_overrides or {}).get("rules") or []
         return cls(
-            classifier=HeuristicClassifier.from_pack(pack_dir),
+            classifier=HeuristicClassifier.from_pack(
+                pack_dir,
+                extra_rules=extra_rules,
+            ),
             token_factory=token_factory,
             canary_library=CanaryTemplateLibrary.from_pack(pack_dir),
             tool_registry=ToolRegistry.from_pack(pack_dir, token_factory),
