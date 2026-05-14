@@ -53,6 +53,41 @@ def canonical_bytes_from_snapshot(snapshot: dict[str, bytes]) -> bytes:
     return _serialize_canonical(files)
 
 
+def canonical_bytes_from_hashes(file_hashes: dict[str, str]) -> bytes:
+    """Same canonical-bytes output as `canonical_bytes_from_snapshot`,
+    but takes pre-computed SHA-256 hex hashes per file rather than
+    raw bytes.
+
+    Defends against the decompression-bomb RAM issue: a multi-GB
+    model file no longer needs to be held in memory to compute the
+    pack signature. The PackReader streams large members directly
+    to disk + computes the hash inline; this function consumes that
+    hash map.
+
+    Output bytes are byte-identical to `canonical_bytes_from_snapshot`
+    given equivalent inputs, so signatures verify against either.
+    """
+    files = [
+        (rel, sha)
+        for rel, sha in file_hashes.items()
+        if rel not in EXCLUDED_PATHS
+    ]
+    files.sort(key=lambda item: item[0])
+    parts: list[str] = ['{"files":[']
+    for i, (rel_path, sha) in enumerate(files):
+        if i > 0:
+            parts.append(",")
+        parts.append('{"path":')
+        parts.append(_json_string(rel_path))
+        parts.append(',"sha256":"')
+        parts.append(sha)
+        parts.append('"}')
+    parts.append('],"schema":"')
+    parts.append(CANONICAL_SCHEMA)
+    parts.append('"}')
+    return "".join(parts).encode("utf-8")
+
+
 def _serialize_canonical(files: list[tuple[str, bytes]]) -> bytes:
     files.sort(key=lambda item: item[0])
 

@@ -72,6 +72,36 @@ class LocalLlamaCppBackend(Backend):
         self._model_path = model_path
         self._lora_path = lora_path
 
+    # Bounds on per-request input shape. The emulator already caps the
+    # HTTP body at 256 KiB, but within that an attacker can pack many
+    # small messages or one giant `content` field. Without these caps
+    # llama_cpp would spend seconds tokenizing crafted inputs, pinning
+    # worker threads under modest request volume.
+    _MAX_CONTENT_CHARS = 8 * 1024  # per-message
+    _MAX_MESSAGES = 16             # keep last N messages
+
+    def _truncate_messages(
+        self, messages: list[dict[str, Any]]
+    ) -> list[dict[str, Any]]:
+        """Cap each message's content length + keep only the last N
+        messages. Returns a fresh list; the caller's list is not
+        mutated."""
+        # Take the last _MAX_MESSAGES so the most-recent context wins
+        # if a malicious caller pads the front of the conversation.
+        tail = messages[-self._MAX_MESSAGES:]
+        out: list[dict[str, Any]] = []
+        for m in tail:
+            if not isinstance(m, dict):
+                continue
+            content = m.get("content")
+            if isinstance(content, str) and len(content) > self._MAX_CONTENT_CHARS:
+                content = content[: self._MAX_CONTENT_CHARS]
+            new_m = dict(m)
+            if content is not None:
+                new_m["content"] = content
+            out.append(new_m)
+        return out
+
     def generate(
         self,
         *,
@@ -79,6 +109,11 @@ class LocalLlamaCppBackend(Backend):
         params: GenerationParams,
     ) -> GenerationResult:
         start = time.monotonic()
+
+        # Defensive truncation BEFORE handing to llama_cpp. Without
+        # this, a crafted multi-MB content field forces full-context
+        # tokenization (seconds of CPU) per request — easy DoS.
+        messages = self._truncate_messages(messages)
 
         kwargs: dict[str, Any] = {
             "messages": messages,

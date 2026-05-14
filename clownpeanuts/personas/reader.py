@@ -46,7 +46,10 @@ from typing import Any
 
 import zstandard as zstd
 
-from clownpeanuts.personas.canonical import canonical_bytes_from_snapshot
+from clownpeanuts.personas.canonical import (
+    canonical_bytes_from_hashes,
+    canonical_bytes_from_snapshot,
+)
 from clownpeanuts.personas.manifest import ManifestError, PackManifest
 from clownpeanuts.personas.trust import SignatureError, TrustStore
 
@@ -73,13 +76,22 @@ class PackReader:
         work_dir: Path,
         manifest: PackManifest,
         snapshot: dict[str, bytes],
+        file_hashes: dict[str, str] | None = None,
     ) -> None:
         self._work_dir = work_dir
         self._manifest = manifest
-        # Verified-source snapshot of every file in the pack. Keyed by
-        # forward-slash relative path. Used for hashing + canonical-bytes
-        # so the verifier never re-reads disk between verify() and use.
+        # In-memory snapshot of SMALL pack files (manifest, sigs, traps,
+        # prompts, fingerprints — KB-scale). Large files (model.gguf,
+        # multi-hundred-MB ONNX weights) are NOT held in memory; they
+        # stream directly to `work_dir` during load with their hashes
+        # tracked in `_file_sha256s`. The verifier uses `_file_sha256s`
+        # instead of re-hashing in-memory bytes.
         self._snapshot = snapshot
+        # SHA-256 hex per file, populated during load_snapshot for
+        # every member (in-memory AND on-disk). Used by canonical-
+        # bytes computation and verify(). Empty dict means legacy
+        # mode — verify() falls back to hashing snapshot bytes.
+        self._file_sha256s: dict[str, str] = file_hashes or {}
         self._verified = False
         self._closed = False
 
@@ -99,7 +111,13 @@ class PackReader:
 
         tmp = Path(tempfile.mkdtemp(prefix="hdl-pack-"))
         try:
-            snapshot = cls._load_snapshot(path)
+            # Pass work_dir so large files stream directly to disk
+            # during load rather than going through a multi-GB BytesIO
+            # → snapshot dict → second on-disk copy in
+            # _extract_validated_snapshot. Memory footprint is now
+            # bounded by the total size of "small" pack files
+            # (manifest, traps, prompts) — KB-scale.
+            snapshot, file_hashes = cls._load_snapshot(path, work_dir=tmp)
             cls._extract_validated_snapshot(snapshot, tmp)
             manifest_bytes = snapshot.get("manifest.toml")
             if manifest_bytes is None:
@@ -108,7 +126,12 @@ class PackReader:
                 manifest = PackManifest.from_toml_bytes(manifest_bytes)
             except ManifestError as e:
                 raise PackError(f"invalid manifest: {e}") from e
-            return cls(work_dir=tmp, manifest=manifest, snapshot=snapshot)
+            return cls(
+                work_dir=tmp,
+                manifest=manifest,
+                snapshot=snapshot,
+                file_hashes=file_hashes,
+            )
         except Exception:
             shutil.rmtree(tmp, ignore_errors=True)
             raise
@@ -193,25 +216,39 @@ class PackReader:
                 f"got cp={cp_version}"
             )
 
-        # 3. pack.sig over canonical bytes (from the snapshot)
+        # 3. pack.sig over canonical bytes (from the file hashes,
+        # which were computed during load streaming — avoids holding
+        # multi-GB model bytes in memory just to re-hash them here).
         try:
             pack_sig = self._read_snapshot("pack.sig")
         except PackError as e:
             raise PackError(f"pack.sig missing: {e}") from e
-        canonical = canonical_bytes_from_snapshot(self._snapshot)
+        if self._file_sha256s:
+            canonical = canonical_bytes_from_hashes(self._file_sha256s)
+        else:
+            # Legacy/test path: file_hashes empty → fall back to the
+            # bytes-based canonicalizer (snapshot has every file).
+            canonical = canonical_bytes_from_snapshot(self._snapshot)
         try:
             trust.verify(canonical, pack_sig)
         except SignatureError as e:
             raise PackError(f"pack.sig verification failed: {e}") from e
 
-        # 4. model file hash (from the snapshot, not from disk)
+        # 4. model file hash. Prefer the load-time hash (computed
+        # while streaming) over re-hashing in-memory bytes; for large
+        # models the bytes aren't in memory at all post-streaming.
         model_rel = self._manifest.model.file
         if model_rel:
-            try:
-                model_bytes = self._read_snapshot(model_rel)
-            except PackError as e:
-                raise PackError(f"model file missing: {e}") from e
-            actual_sha = hashlib.sha256(model_bytes).hexdigest()
+            normalized_model = _normalize_rel_path(model_rel)
+            actual_sha = self._file_sha256s.get(normalized_model)
+            if actual_sha is None:
+                # Legacy path: hashes map wasn't populated; re-hash
+                # the in-memory snapshot bytes if present.
+                try:
+                    model_bytes = self._read_snapshot(model_rel)
+                except PackError as e:
+                    raise PackError(f"model file missing: {e}") from e
+                actual_sha = hashlib.sha256(model_bytes).hexdigest()
             expected = self._manifest.model.sha256
             if actual_sha != expected:
                 raise PackError(
@@ -252,23 +289,52 @@ class PackReader:
             raise PackError(f"file not found in pack: {rel_path}")
         return data
 
-    @classmethod
-    def _load_snapshot(cls, path: Path) -> dict[str, bytes]:
-        """Stream the .hdl, validate every member, return {rel_path: bytes}.
+    # Files larger than this stream directly to `work_dir` during load
+    # instead of being buffered fully in memory. Picked at 64 MiB so
+    # the typical model.gguf (~4.5 GB) streams but every other pack
+    # asset (manifest, traps, prompts, fingerprints, system_prompt)
+    # stays in memory for fast canonical-bytes computation. Adjust
+    # if pack contents change shape.
+    _STREAM_TO_DISK_THRESHOLD = 64 * 1024 * 1024
 
-        Caps:
+    @classmethod
+    def _load_snapshot(
+        cls, path: Path, *, work_dir: Path
+    ) -> tuple[dict[str, bytes], dict[str, str]]:
+        """Stream the .hdl, validate every member.
+
+        Returns `(snapshot, file_hashes)`:
+          - `snapshot` — `{rel_path: bytes}` for SMALL members only
+            (size < `_STREAM_TO_DISK_THRESHOLD`).
+          - `file_hashes` — `{rel_path: sha256_hex}` for EVERY member,
+            including large ones streamed to `work_dir`.
+
+        Large members are written directly to `work_dir/rel_path`
+        during load (with directories created on demand) rather than
+        held in memory; their hash is computed inline. This bounds
+        peak memory by the sum of small files instead of the total
+        pack size.
+
+        Caps unchanged:
         - total decompressed bytes ≤ _MAX_DECOMPRESSED_BYTES
         - member count ≤ _MAX_MEMBER_COUNT
         - per-member ≤ _MAX_MEMBER_BYTES
         """
         snapshot: dict[str, bytes] = {}
+        file_hashes: dict[str, str] = {}
         total_bytes = 0
         with path.open("rb") as fin:
             dctx = zstd.ZstdDecompressor()
             with dctx.stream_reader(fin) as decompressed:
-                with tarfile.open(fileobj=decompressed, mode="r|") as tar:
+                # errorlevel=2: surface tar-format errors as exceptions
+                # rather than swallowing them silently (the default).
+                # An adversarial pack with corrupt headers should fail
+                # loudly, not return partial content.
+                with tarfile.open(
+                    fileobj=decompressed, mode="r|", errorlevel=2
+                ) as tar:
                     for member in tar:
-                        if len(snapshot) >= _MAX_MEMBER_COUNT:
+                        if len(file_hashes) >= _MAX_MEMBER_COUNT:
                             raise PackError(
                                 f"pack exceeds member-count cap "
                                 f"({_MAX_MEMBER_COUNT})"
@@ -283,32 +349,50 @@ class PackReader:
                                 f"pack member {member.name!r} declares "
                                 f"invalid size: {member.size}"
                             )
-                        # stream the member, accumulate, enforce caps
                         f = tar.extractfile(member)
                         if f is None:
                             continue
-                        buf = io.BytesIO()
-                        remaining = _MAX_MEMBER_BYTES
-                        while True:
-                            chunk = f.read(_READ_CHUNK)
-                            if not chunk:
-                                break
-                            remaining -= len(chunk)
-                            total_bytes += len(chunk)
-                            if remaining < 0:
-                                raise PackError(
-                                    f"pack member {member.name!r} exceeds "
-                                    f"per-file cap"
-                                )
-                            if total_bytes > _MAX_DECOMPRESSED_BYTES:
-                                raise PackError(
-                                    f"pack exceeds total decompressed cap "
-                                    f"({_MAX_DECOMPRESSED_BYTES} bytes)"
-                                )
-                            buf.write(chunk)
                         normalized = _normalize_rel_path(member.name)
-                        snapshot[normalized] = buf.getvalue()
-        return snapshot
+                        # Branch on size: small files go in the in-mem
+                        # snapshot; large ones stream to disk.
+                        stream_to_disk = (
+                            member.size > cls._STREAM_TO_DISK_THRESHOLD
+                        )
+                        hasher = hashlib.sha256()
+                        remaining = _MAX_MEMBER_BYTES
+                        if stream_to_disk:
+                            target = work_dir / normalized
+                            target.parent.mkdir(parents=True, exist_ok=True)
+                            sink: io.IOBase = target.open("wb")
+                        else:
+                            sink = io.BytesIO()
+                        try:
+                            while True:
+                                chunk = f.read(_READ_CHUNK)
+                                if not chunk:
+                                    break
+                                remaining -= len(chunk)
+                                total_bytes += len(chunk)
+                                if remaining < 0:
+                                    raise PackError(
+                                        f"pack member {member.name!r} exceeds "
+                                        f"per-file cap"
+                                    )
+                                if total_bytes > _MAX_DECOMPRESSED_BYTES:
+                                    raise PackError(
+                                        f"pack exceeds total decompressed cap "
+                                        f"({_MAX_DECOMPRESSED_BYTES} bytes)"
+                                    )
+                                hasher.update(chunk)
+                                sink.write(chunk)
+                        finally:
+                            if stream_to_disk:
+                                sink.close()
+                        file_hashes[normalized] = hasher.hexdigest()
+                        if not stream_to_disk:
+                            assert isinstance(sink, io.BytesIO)
+                            snapshot[normalized] = sink.getvalue()
+        return snapshot, file_hashes
 
     @staticmethod
     def _extract_validated_snapshot(
@@ -387,6 +471,22 @@ def _validate_tar_member(member: tarfile.TarInfo) -> None:
     if member.ischr() or member.isblk() or member.isfifo():
         raise PackError(
             f"pack contains device/fifo entry ({name!r}); rejected for safety"
+        )
+
+    # Reject GNU sparse/long-name/long-link types. Sparse members
+    # report a small `size` but `extractfile()` can return unexpected
+    # hole bytes, bypassing per-member size accounting. LONGNAME /
+    # LONGLINK members carry metadata that affects subsequent members'
+    # interpretation — a hostile pack could smuggle a long path that
+    # later evaluates as `../../etc/passwd`. The pack writer only
+    # produces REGTYPE + DIRTYPE entries, so any other type is
+    # adversarial.
+    allowed_types = {tarfile.REGTYPE, tarfile.AREGTYPE, tarfile.DIRTYPE}
+    if member.type not in allowed_types:
+        raise PackError(
+            f"pack contains unsupported tar entry type "
+            f"{member.type!r} ({name!r}); only regular files and "
+            f"directories are accepted"
         )
 
     # Path traversal / absolute-path / NUL / non-ASCII guard.

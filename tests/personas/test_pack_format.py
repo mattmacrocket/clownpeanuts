@@ -286,3 +286,106 @@ def _tamper_pack(
                     with p.open("rb") as f:
                         tar.addfile(info, fileobj=f)
     return out_path
+
+
+# ---------- deferred-audit hardening (Batch D) ----------
+
+
+def test_reader_rejects_unsupported_tar_entry_types() -> None:
+    """Regression: pre-fix the validator only rejected sym/hard/dev/fifo
+    entries by `isfile()` check after the type guard. GNU sparse +
+    LONGNAME/LONGLINK members slip through. Now `_validate_tar_member`
+    explicitly checks `member.type in {REGTYPE, AREGTYPE, DIRTYPE}`."""
+    import tarfile
+    from clownpeanuts.personas.reader import _validate_tar_member, PackError
+
+    # GNU-style long-name entry
+    info = tarfile.TarInfo("dummy")
+    info.type = tarfile.GNUTYPE_LONGNAME
+    with pytest.raises(PackError, match=r"unsupported tar entry type"):
+        _validate_tar_member(info)
+
+    # Sparse file
+    info2 = tarfile.TarInfo("sparse")
+    info2.type = tarfile.GNUTYPE_SPARSE
+    with pytest.raises(PackError, match=r"unsupported tar entry type"):
+        _validate_tar_member(info2)
+
+
+def test_load_snapshot_returns_file_hashes_for_all_members() -> None:
+    """Regression for the decomp-bomb fix: file_hashes must include
+    EVERY member regardless of whether it was buffered to memory or
+    streamed to disk."""
+    from pathlib import Path
+    from clownpeanuts.personas.reader import PackReader
+
+    pack = _ensure_dummy_pack_built()
+    with PackReader.open(pack) as reader:
+        reader.verify(TrustStore.default())
+        # Every file in the pack should have a hash recorded
+        assert reader._file_sha256s, "file_hashes must be populated"
+        # The model file (even though small in the dummy pack) is
+        # always present
+        manifest_model = reader.manifest().model.file
+        if manifest_model:
+            assert manifest_model in reader._file_sha256s
+
+
+def test_canonical_bytes_from_hashes_matches_from_snapshot() -> None:
+    """The two canonicalizers must produce identical bytes for the
+    same input. If they ever diverge, signatures verify-with-one
+    won't verify-with-the-other and a deployed pack mysteriously
+    fails to load."""
+    from clownpeanuts.personas.canonical import (
+        canonical_bytes_from_hashes,
+        canonical_bytes_from_snapshot,
+    )
+    import hashlib
+
+    snapshot = {
+        "manifest.toml": b"[pack]\nid = \"test\"\n",
+        "model/model.gguf": b"GGUF\x00\x01\x02\x03",
+        "traps/classifiers.yaml": b"heuristics:\n  threshold: 0.5\n",
+        "pack.sig": b"signature-excluded",
+    }
+    hashes = {
+        rel: hashlib.sha256(content).hexdigest()
+        for rel, content in snapshot.items()
+    }
+
+    bytes_from_snapshot = canonical_bytes_from_snapshot(snapshot)
+    bytes_from_hashes = canonical_bytes_from_hashes(hashes)
+    assert bytes_from_snapshot == bytes_from_hashes, (
+        "canonical_bytes_from_hashes must produce byte-identical "
+        "output to canonical_bytes_from_snapshot — signatures depend "
+        "on this invariant"
+    )
+
+
+def test_llama_truncate_messages_caps_content_and_count() -> None:
+    """Regression: local llama-cpp backend had no input length cap.
+    A 256-KiB body with one giant content field forced full-context
+    tokenization per request — easy DoS."""
+    from clownpeanuts.services.vuln_llm.inference.local_llama_cpp import (
+        LocalLlamaCppBackend,
+    )
+
+    # Construct without actually loading the model
+    inst = LocalLlamaCppBackend.__new__(LocalLlamaCppBackend)
+
+    # Per-message content cap
+    huge = "x" * 100_000
+    msgs = [{"role": "user", "content": huge}]
+    out = inst._truncate_messages(msgs)
+    assert len(out[0]["content"]) <= inst._MAX_CONTENT_CHARS
+
+    # Message-count cap — only the last MAX_MESSAGES kept
+    many = [
+        {"role": "user" if i % 2 == 0 else "assistant", "content": f"msg{i}"}
+        for i in range(50)
+    ]
+    out = inst._truncate_messages(many)
+    assert len(out) <= inst._MAX_MESSAGES
+    # Must keep the MOST RECENT messages (defense against
+    # adversarial padding at the front)
+    assert out[-1]["content"] == "msg49"
