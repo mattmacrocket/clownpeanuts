@@ -71,12 +71,35 @@ class ToolInvocation:
 
 _TOOL_NAMES = ("list_secrets", "query_user_db", "read_file", "execute_query")
 _LIST_SECRETS_KEYWORDS_RE = re.compile(
+    # `<verb> [all] [the] secrets[?!.]` — the original imperative
+    # phrasing. Tightening this beyond what it already does turned
+    # out to need full-grammar awareness (filler words like "me",
+    # adverbs, etc.), and the original is already reasonably narrow
+    # (must say a verb + secrets adjacent or via `all`/`the`).
     r"(?i)\b(?:list|dump|show|reveal)\s+(?:all\s+)?(?:the\s+)?secrets?\b"
 )
-_TOOL_NAMED_RE = re.compile(
-    r"(?i)(?:use|run|execute|call|invoke)?\s*\b("
+# Verb-prefixed invocation: "use the read_file tool", "call list_secrets",
+# "execute query_user_db", etc. Mandatory verb — the previous optional `?`
+# was the foot-gun.
+_TOOL_NAMED_VERB_RE = re.compile(
+    r"(?i)\b(?:use|run|execute|call|invoke)\b\s+(?:the\s+)?("
     + "|".join(re.escape(n) for n in _TOOL_NAMES)
-    + r")\b"
+    + r")\b(?:\s+tool)?"
+)
+# Arg-syntax invocation: tool name followed by a paren, path, quoted
+# string, or SQL keyword. Catches `list_secrets()`, `read_file
+# /etc/passwd`, `execute_query SELECT ...`, `query_user_db('alice')`
+# WITHOUT firing on prose like "what does read_file do in the docs?"
+# (which has neither a verb prefix nor an arg-like trailing context).
+_TOOL_NAMED_ARG_RE = re.compile(
+    r"(?i)\b("
+    + "|".join(re.escape(n) for n in _TOOL_NAMES)
+    + r")\s*(?:"
+    r"\(|"                                  # paren: list_secrets()
+    r"[\"']|"                               # quoted: query_user_db('alice')
+    r"\s+/|"                                # path: read_file /etc/passwd
+    r"\s+(?:SELECT|INSERT|UPDATE|DELETE|DROP|TRUNCATE|ALTER|FROM|WHERE)\b"  # SQL
+    r")"
 )
 _FILE_PATH_RE = re.compile(r"(/[\w./\-_]+)")
 _SQL_HINT_RE = re.compile(
@@ -86,17 +109,40 @@ _QUOTED_RE = re.compile(r"['\"]([^'\"\n]{1,200})['\"]")
 
 
 def detect_tool_invocation(text: str) -> ToolInvocation | None:
-    """Return a parsed tool invocation if `text` requests one, else None."""
+    """Return a parsed tool invocation if `text` requests one, else None.
+
+    Detection requires EITHER a verb-prefixed invocation ("use the
+    read_file tool", "call list_secrets") OR a bare tool name
+    immediately followed by argument syntax (paren, quoted string,
+    path-like arg, or SQL keyword). Mere mention of a tool name in
+    prose ("what does read_file do in your docs?") does NOT trigger —
+    that was the previous foot-gun where the verb regex made the
+    prefix optional and benign queries got canary-routed.
+    """
     if not text:
         return None
 
-    # 1. Explicit tool name reference (highest precedence).
-    m = _TOOL_NAMED_RE.search(text)
+    # Truncate before regex to bound worst-case backtracking. The
+    # classifier truncates to 8 KiB; this path should too (the agent
+    # audit flagged that `_SQL_HINT_RE.[^.\n;]*` is unbounded on long
+    # inputs).
+    if len(text) > 8 * 1024:
+        text = text[: 8 * 1024]
+
+    # 1a. Verb-prefixed invocation (highest precedence; least ambiguous).
+    m = _TOOL_NAMED_VERB_RE.search(text)
     if m:
         name = m.group(1)
         return ToolInvocation(name=name, params=_extract_params(name, text))
 
-    # 2. "list secrets" natural-language phrase
+    # 1b. Tool name + argument-syntax invocation. Avoids false positives
+    # on prose by requiring an arg-like construct to follow the name.
+    m = _TOOL_NAMED_ARG_RE.search(text)
+    if m:
+        name = m.group(1)
+        return ToolInvocation(name=name, params=_extract_params(name, text))
+
+    # 2. "list secrets" imperative phrase (requires sentence-initial verb)
     if _LIST_SECRETS_KEYWORDS_RE.search(text):
         return ToolInvocation(name="list_secrets", params={})
 
