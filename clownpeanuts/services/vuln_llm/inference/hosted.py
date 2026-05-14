@@ -12,7 +12,9 @@ service config.
 
 from __future__ import annotations
 
+import ipaddress
 import json
+import socket
 import time
 from typing import Any
 from urllib import request as urlrequest
@@ -31,6 +33,130 @@ from clownpeanuts.services.vuln_llm.inference.base import (
 # config (env, secret store, etc.) could otherwise pivot the service
 # into reading local files or arbitrary protocols.
 _ALLOWED_SCHEMES = frozenset({"http", "https"})
+
+
+def _is_private_or_special_ip(addr_str: str) -> bool:
+    """Return True if `addr_str` is a private, loopback, link-local,
+    multicast, or otherwise reserved IP address.
+
+    Defends against SSRF via operator-config tampering:
+    - 127.0.0.1 / ::1 (loopback)
+    - 169.254.169.254 (AWS/Azure/GCP IMDS metadata service)
+    - 10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16 (RFC1918 private)
+    - 100.64.0.0/10 (CGNAT — internal corporate ranges)
+    - fc00::/7 (IPv6 ULA)
+    """
+    try:
+        ip = ipaddress.ip_address(addr_str)
+    except ValueError:
+        return False
+    return (
+        ip.is_private
+        or ip.is_loopback
+        or ip.is_link_local
+        or ip.is_multicast
+        or ip.is_reserved
+        or ip.is_unspecified
+    )
+
+
+def _validate_hosted_endpoint(endpoint: str, *, allow_private: bool = False) -> None:
+    """Reject SSRF-shaped hosted endpoints.
+
+    Beyond the existing scheme check, this rejects:
+    1. URLs with userinfo (`http://google.com@evil.example/`) — the
+       `netloc` containing `@` parses as `userinfo@host`, and the host
+       actually resolved is the post-@ part. Easy SSRF if an attacker
+       can tamper with operator config.
+    2. URLs with query or fragment components — operator should not
+       be putting auth tokens or other secrets in the URL itself,
+       and trailing query strings often leak into upstream logs.
+    3. Hostnames that resolve (via getaddrinfo) to private,
+       loopback, link-local, multicast, or reserved IPs unless
+       `allow_private` is explicitly set. Most importantly, this
+       blocks the AWS/Azure/GCP instance metadata service at
+       169.254.169.254 which can yield instance credentials.
+    4. Literal IP-address hosts that are private/special.
+
+    Raises ValueError with a clear message on rejection.
+    """
+    parsed = urlparse(endpoint)
+
+    if parsed.username is not None or parsed.password is not None:
+        raise ValueError(
+            f"HostedBackend: endpoint has userinfo (username/password "
+            f"in URL); reject because `http://google.com@evil.example/` "
+            f"shape is an SSRF vector. Put credentials in the "
+            f"Authorization header via `hosted_api_key_from`."
+        )
+    if parsed.query or parsed.fragment:
+        raise ValueError(
+            f"HostedBackend: endpoint must not contain a query or "
+            f"fragment (got {endpoint!r}); put authentication in the "
+            f"Authorization header, not the URL."
+        )
+
+    host = parsed.hostname
+    if not host:
+        raise ValueError(
+            f"HostedBackend: endpoint has no host: {endpoint!r}"
+        )
+
+    # Reject IDN homoglyphs / non-ASCII hosts up front.
+    try:
+        host.encode("ascii")
+    except UnicodeEncodeError:
+        raise ValueError(
+            f"HostedBackend: non-ASCII hostname {host!r} rejected "
+            f"(IDN homoglyph SSRF risk); use the explicit punycode "
+            f"form if this is intentional."
+        ) from None
+
+    if allow_private:
+        return
+
+    # If host is a literal IP, check directly. Otherwise resolve via
+    # getaddrinfo and check every result — a hostname might resolve
+    # to BOTH a public and a private IP (split-horizon DNS).
+    if _is_private_or_special_ip(host):
+        raise ValueError(
+            f"HostedBackend: endpoint host {host!r} is a "
+            f"private/loopback/reserved IP; set `hosted_allow_private "
+            f"= true` in service config if this is intentional "
+            f"(e.g. on-host Ollama)."
+        )
+    try:
+        infos = socket.getaddrinfo(host, None)
+    except socket.gaierror:
+        # If resolution fails at config time, fall through — the actual
+        # request will fail with a clear connection error rather than
+        # us hard-failing at service load on DNS hiccups.
+        return
+    for info in infos:
+        sockaddr = info[4]
+        if sockaddr and _is_private_or_special_ip(str(sockaddr[0])):
+            raise ValueError(
+                f"HostedBackend: endpoint host {host!r} resolves to "
+                f"private/reserved IP {sockaddr[0]!r}; set "
+                f"`hosted_allow_private = true` in service config if "
+                f"this is intentional (e.g. on-host Ollama)."
+            )
+
+
+def _sanitize_error(s: str, *, max_len: int = 200) -> str:
+    """Truncate and strip control characters from an error message.
+
+    Upstream HTTP error reasons can include the URL (which may have
+    contained query-string credentials before our validator rejected
+    those configs) or bytes from the response body. Bound the length
+    and strip control chars to prevent log spoofing / token leakage.
+    """
+    if not isinstance(s, str):
+        s = repr(s)
+    s = s.replace("\r", " ").replace("\n", " ").replace("\t", " ")
+    if len(s) > max_len:
+        s = s[:max_len] + "...(truncated)"
+    return s
 
 
 class _NoRedirectHandler(urlrequest.HTTPRedirectHandler):
@@ -63,6 +189,7 @@ class HostedBackend(Backend):
         api_key: str = "",
         timeout_seconds: float = 30.0,
         max_response_bytes: int = 1 * 1024 * 1024,  # 1 MiB cap
+        allow_private: bool = False,
     ) -> None:
         if not endpoint:
             raise ValueError("HostedBackend: endpoint is required")
@@ -78,10 +205,10 @@ class HostedBackend(Backend):
                 f"HostedBackend: endpoint scheme must be one of "
                 f"{sorted(_ALLOWED_SCHEMES)}, got '{parsed.scheme}'"
             )
-        if not parsed.netloc:
-            raise ValueError(
-                f"HostedBackend: endpoint has no host: {endpoint!r}"
-            )
+        # Full SSRF defense: userinfo, query/fragment, IDN, private IPs.
+        # `allow_private=True` is an explicit operator opt-in for the
+        # legitimate on-host-Ollama deployment shape.
+        _validate_hosted_endpoint(endpoint, allow_private=allow_private)
         self._endpoint = endpoint
         self._provider = provider
         self._model = model
@@ -116,11 +243,17 @@ class HostedBackend(Backend):
             with _OPENER.open(req, timeout=self._timeout) as resp:
                 response_bytes = resp.read(self._max_bytes)
         except HTTPError as e:
+            # Upstream `reason` can include attacker-controlled bytes
+            # (a compromised upstream sets the reason phrase to anything).
+            # Sanitize before logging.
             return self._error_result(
-                start, f"HTTP {e.code}: {e.reason}"
+                start, f"HTTP {e.code}: {_sanitize_error(str(e.reason))}"
             )
         except URLError as e:
-            return self._error_result(start, f"connection error: {e.reason}")
+            return self._error_result(
+                start,
+                f"connection error: {_sanitize_error(str(e.reason))}",
+            )
         except Exception as e:  # noqa: BLE001
             return self._error_result(
                 start, f"hosted backend error: {type(e).__name__}"

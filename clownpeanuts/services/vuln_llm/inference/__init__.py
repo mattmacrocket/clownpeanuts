@@ -62,12 +62,18 @@ def get_backend(
         model = str(cfg.get("hosted_model", "") or manifest.pack.id).strip()
         api_key = str(cfg.get("hosted_api_key", "") or "").strip()
         timeout = float(cfg.get("hosted_timeout_seconds", 30.0))
+        # SSRF defense: by default reject endpoints resolving to
+        # private/loopback/metadata IPs (169.254.169.254, RFC1918,
+        # etc.). Operators running an on-host Ollama can opt in with
+        # `hosted_allow_private = true` in service config.
+        allow_private = bool(cfg.get("hosted_allow_private", False))
         return HostedBackend(
             endpoint=endpoint,
             provider=provider,
             model=model,
             api_key=api_key,
             timeout_seconds=timeout,
+            allow_private=allow_private,
         )
 
     if requested == "local-llama-cpp":

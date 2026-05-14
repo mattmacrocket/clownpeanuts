@@ -183,7 +183,7 @@ def ollama_mock() -> Any:
 
 
 def test_hosted_openai_wire_format(openai_mock: str) -> None:
-    b = HostedBackend(endpoint=openai_mock, provider="openai", model="x")
+    b = HostedBackend(endpoint=openai_mock, provider="openai", model="x", allow_private=True)
     r = b.generate(
         messages=[{"role": "user", "content": "hi"}],
         params=GenerationParams(),
@@ -197,7 +197,7 @@ def test_hosted_openai_wire_format(openai_mock: str) -> None:
 
 
 def test_hosted_ollama_wire_format(ollama_mock: str) -> None:
-    b = HostedBackend(endpoint=ollama_mock, provider="ollama", model="x")
+    b = HostedBackend(endpoint=ollama_mock, provider="ollama", model="x", allow_private=True)
     r = b.generate(
         messages=[{"role": "user", "content": "ping"}],
         params=GenerationParams(),
@@ -223,6 +223,7 @@ def test_hosted_connection_error_returns_error_result() -> None:
         endpoint="http://127.0.0.1:1/v1/chat/completions",
         provider="openai",
         timeout_seconds=1.0,
+        allow_private=True,
     )
     r = b.generate(
         messages=[{"role": "user", "content": "x"}],
@@ -280,6 +281,9 @@ def test_factory_passes_hosted_config(openai_mock: str) -> None:
                 "hosted_endpoint": openai_mock,
                 "hosted_provider": "openai",
                 "hosted_model": "test",
+                # openai_mock is a loopback HTTP server fixture; opt in
+                # explicitly under the post-SSRF-fix config schema.
+                "hosted_allow_private": True,
             },
         )
         assert b.name == "hosted"
@@ -354,3 +358,90 @@ def test_local_llama_cpp_missing_dep_message() -> None:
 
     with pytest.raises(LocalLlamaCppError, match="llama-cpp-python"):
         LocalLlamaCppBackend(model_path=Path("/nonexistent/model.gguf"))
+
+
+# ---------- SSRF defense (hosted backend audit) ----------
+
+
+def test_hosted_rejects_userinfo_in_url() -> None:
+    """`http://google.com@evil.example/` parses as userinfo@host
+    where the actual resolved host is `evil.example`. Classic SSRF
+    vector via operator-config tampering."""
+    from clownpeanuts.services.vuln_llm.inference.hosted import HostedBackend
+
+    with pytest.raises(ValueError, match=r"userinfo"):
+        HostedBackend(endpoint="http://google.com@evil.example/", provider="openai")
+
+
+def test_hosted_rejects_query_string() -> None:
+    """Operators shouldn't be putting credentials in URLs (they leak
+    into upstream logs). Reject any endpoint with a query component."""
+    from clownpeanuts.services.vuln_llm.inference.hosted import HostedBackend
+
+    with pytest.raises(ValueError, match=r"query"):
+        HostedBackend(
+            endpoint="https://api.example.com/v1/chat?api_key=secret",
+            provider="openai",
+        )
+
+
+def test_hosted_rejects_metadata_service_ip() -> None:
+    """169.254.169.254 is the AWS/Azure/GCP instance metadata service.
+    SSRF to it yields instance credentials. Must reject."""
+    from clownpeanuts.services.vuln_llm.inference.hosted import HostedBackend
+
+    with pytest.raises(ValueError, match=r"private/reserved|private/loopback"):
+        HostedBackend(
+            endpoint="http://169.254.169.254/latest/meta-data/",
+            provider="openai",
+        )
+
+
+def test_hosted_rejects_rfc1918_private_ips_by_default() -> None:
+    from clownpeanuts.services.vuln_llm.inference.hosted import HostedBackend
+
+    for ip in ("10.0.0.1", "172.16.0.1", "192.168.1.1"):
+        with pytest.raises(ValueError, match=r"private/(loopback|reserved)"):
+            HostedBackend(
+                endpoint=f"http://{ip}/v1/chat", provider="openai"
+            )
+
+
+def test_hosted_allows_private_with_explicit_opt_in() -> None:
+    """Legitimate on-host Ollama deployment: explicit allow_private=True."""
+    from clownpeanuts.services.vuln_llm.inference.hosted import HostedBackend
+
+    # Should construct without error
+    b = HostedBackend(
+        endpoint="http://127.0.0.1:11434/api/chat",
+        provider="ollama",
+        allow_private=True,
+    )
+    assert b._endpoint == "http://127.0.0.1:11434/api/chat"
+
+
+def test_hosted_rejects_idn_hostname() -> None:
+    """Non-ASCII hosts are a homoglyph SSRF vector (xn-- form should be
+    explicit). Reject anything that won't encode as ASCII."""
+    from clownpeanuts.services.vuln_llm.inference.hosted import HostedBackend
+
+    with pytest.raises(ValueError, match=r"non-ASCII"):
+        HostedBackend(endpoint="http://gооgle.com/", provider="openai")
+        # Note: those o's are Cyrillic homoglyphs
+
+
+def test_sanitize_error_strips_control_chars_and_truncates() -> None:
+    """Bearer tokens and other secrets must not survive a malicious
+    upstream response that includes them in a `reason` phrase."""
+    from clownpeanuts.services.vuln_llm.inference.hosted import _sanitize_error
+
+    # Control chars stripped
+    s = _sanitize_error("error\r\nAuthorization: Bearer secret\r\n")
+    assert "\r" not in s
+    assert "\n" not in s
+
+    # Long strings truncated
+    long_err = "x" * 5000
+    out = _sanitize_error(long_err)
+    assert len(out) < 250
+    assert out.endswith("(truncated)")
